@@ -1,0 +1,349 @@
+"""Main window for the sensor test GUI."""
+from __future__ import annotations
+
+import csv
+import datetime as _dt
+from typing import List, Optional
+
+from PySide6.QtCore import QMetaObject, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QFont
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDockWidget,
+    QFileDialog,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolBar,
+)
+
+from ..config import AppConfig
+from ..driver.keyence_dlen1 import KeyenceDLEN1Driver
+from ..models import Judgment, SensorReading
+from .poller import PollWorker
+
+# Table columns
+COL_CH, COL_VALUE, COL_PEAK, COL_BOTTOM, COL_PP, COL_JUDGE, COL_STATUS = range(7)
+
+_JUDGE_COLOR = {
+    Judgment.GO: QColor("#1b8a3a"),
+    Judgment.HI: QColor("#c0392b"),
+    Judgment.LO: QColor("#2471a3"),
+    Judgment.NONE: QColor("#7f8c8d"),
+}
+
+
+class MainWindow(QMainWindow):
+    # Signals to the worker (delivered to the worker thread as queued calls).
+    request_open = Signal()
+    request_close = Signal()
+    request_interval = Signal(int)
+
+    def __init__(self, config: AppConfig):
+        super().__init__()
+        self.config = config
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[PollWorker] = None
+        self._driver: Optional[KeyenceDLEN1Driver] = None
+        self._connected = False
+
+        self._csv_file = None
+        self._csv_writer = None
+        self._last_update: Optional[_dt.datetime] = None
+
+        self.setWindowTitle("KEYENCE GT2 / DL-EN1 — Sensor Monitor")
+        self.resize(1000, 560)
+
+        self._build_toolbar()
+        self._build_table()
+        self._build_hex_dock()
+        self._build_statusbar()
+        self._update_conn_ui(False)
+
+    # ------------------------------------------------------------------ UI -- #
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("Kết nối")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+
+        tb.addWidget(QLabel(" IP: "))
+        self.ip_edit = QLineEdit(self.config.device.ip)
+        self.ip_edit.setFixedWidth(130)
+        tb.addWidget(self.ip_edit)
+
+        tb.addWidget(QLabel("  Assembly: "))
+        self.instance_spin = QSpinBox()
+        self.instance_spin.setRange(1, 65535)
+        self.instance_spin.setValue(self.config.device.assembly_instance)
+        self.instance_spin.setToolTip("Input assembly instance của DL-EN1")
+        tb.addWidget(self.instance_spin)
+
+        tb.addWidget(QLabel("  Chu kỳ (ms): "))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(20, 10000)
+        self.interval_spin.setSingleStep(20)
+        self.interval_spin.setValue(self.config.polling.interval_ms)
+        self.interval_spin.valueChanged.connect(self._on_interval_changed)
+        tb.addWidget(self.interval_spin)
+
+        tb.addSeparator()
+        self.connect_btn = QPushButton("Kết nối")
+        self.connect_btn.clicked.connect(self._on_connect_clicked)
+        tb.addWidget(self.connect_btn)
+
+        tb.addSeparator()
+        self.csv_chk = QCheckBox("Ghi CSV")
+        self.csv_chk.toggled.connect(self._on_csv_toggled)
+        tb.addWidget(self.csv_chk)
+
+        self.hex_chk = QCheckBox("Xem dữ liệu thô")
+        self.hex_chk.toggled.connect(lambda on: self.hex_dock.setVisible(on))
+        tb.addWidget(self.hex_chk)
+
+    def _build_table(self) -> None:
+        unit = self.config.display.unit
+        headers = [
+            "Kênh",
+            f"Giá trị ({unit})",
+            f"Peak ({unit})",
+            f"Bottom ({unit})",
+            f"P-P ({unit})",
+            "Phán định",
+            "Trạng thái",
+        ]
+        n = self.config.channels.count
+        self.table = QTableWidget(n, len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.TypeWriter)
+
+        for ch in range(n):
+            name_item = QTableWidgetItem(self.config.channels.name(ch))
+            name_item.setTextAlignment(Qt.AlignCenter)
+            f = name_item.font()
+            f.setBold(True)
+            name_item.setFont(f)
+            self.table.setItem(ch, COL_CH, name_item)
+
+            for col in (COL_VALUE, COL_PEAK, COL_BOTTOM, COL_PP):
+                item = QTableWidgetItem("---")
+                item.setFont(mono)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(ch, col, item)
+
+            for col in (COL_JUDGE, COL_STATUS):
+                item = QTableWidgetItem("--")
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(ch, col, item)
+
+        self.setCentralWidget(self.table)
+
+    def _build_hex_dock(self) -> None:
+        self.hex_dock = QDockWidget("Dữ liệu thô (input assembly)", self)
+        self.hex_view = QPlainTextEdit()
+        self.hex_view.setReadOnly(True)
+        self.hex_view.setFont(QFont("Monospace"))
+        self.hex_dock.setWidget(self.hex_view)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.hex_dock)
+        self.hex_dock.setVisible(False)
+
+    def _build_statusbar(self) -> None:
+        self.conn_label = QLabel()
+        self.update_label = QLabel("")
+        self.statusBar().addWidget(self.conn_label, 1)
+        self.statusBar().addPermanentWidget(self.update_label)
+
+    # -------------------------------------------------------------- actions -- #
+    def _on_connect_clicked(self) -> None:
+        if self._connected or self._thread is not None:
+            self.request_close.emit()
+            return
+        self._start_connection()
+
+    def _start_connection(self) -> None:
+        # Pull the latest values from the toolbar into the config.
+        self.config.device.ip = self.ip_edit.text().strip()
+        self.config.device.assembly_instance = self.instance_spin.value()
+        self.config.polling.interval_ms = self.interval_spin.value()
+
+        self._driver = KeyenceDLEN1Driver(self.config)
+        self._worker = PollWorker(self._driver, self.config.polling.interval_ms)
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+
+        # UI -> worker
+        self.request_open.connect(self._worker.open)
+        self.request_close.connect(self._worker.close)
+        self.request_interval.connect(self._worker.set_interval)
+        # worker -> UI
+        self._worker.connection_changed.connect(self._on_connection_changed)
+        self._worker.readings_ready.connect(self._on_readings)
+        self._worker.raw_ready.connect(self._on_raw)
+        self._worker.error.connect(self._on_error)
+
+        self._thread.start()
+        self.connect_btn.setEnabled(False)
+        self.conn_label.setText(f"Đang kết nối tới {self.config.device.ip} ...")
+        self.request_open.emit()
+
+    def _teardown_thread(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(2000)
+            self._thread = None
+        self._worker = None
+        self._driver = None
+
+    def _on_interval_changed(self, ms: int) -> None:
+        self.config.polling.interval_ms = ms
+        if self._connected:
+            self.request_interval.emit(ms)
+
+    # ------------------------------------------------------------- signals -- #
+    def _on_connection_changed(self, ok: bool) -> None:
+        was_connected = self._connected
+        self._connected = ok
+        self._update_conn_ui(ok)
+        if ok:
+            self.conn_label.setText(f"● Đã kết nối — {self.config.device.ip}")
+        else:
+            # Either a connect failure or a user-initiated disconnect; in both
+            # cases the worker thread is finished with its work.
+            self._teardown_thread()
+            self._mark_all_stale()
+            # On a failed connect, keep the error message set by _on_error;
+            # only show the plain "disconnected" text for a clean disconnect.
+            if was_connected:
+                self.conn_label.setText("○ Đã ngắt kết nối")
+
+    def _on_readings(self, readings: List[SensorReading]) -> None:
+        dec = self.config.display.decimals
+        for r in readings:
+            if r.channel >= self.table.rowCount():
+                continue
+            self._set_num(r.channel, COL_VALUE, r.fmt("value", dec), r.valid)
+            self._set_num(r.channel, COL_PEAK, r.fmt("peak", dec), r.valid)
+            self._set_num(r.channel, COL_BOTTOM, r.fmt("bottom", dec), r.valid)
+            self._set_num(r.channel, COL_PP, r.fmt("pp", dec), r.valid)
+
+            jitem = self.table.item(r.channel, COL_JUDGE)
+            jitem.setText(r.judgment.value)
+            jitem.setForeground(_JUDGE_COLOR.get(r.judgment, _JUDGE_COLOR[Judgment.NONE]))
+
+            sitem = self.table.item(r.channel, COL_STATUS)
+            sitem.setText("OK" if r.valid else "Lỗi/Tràn")
+            sitem.setForeground(QColor("#1b8a3a") if r.valid else QColor("#c0392b"))
+
+        self._last_update = _dt.datetime.now()
+        self.update_label.setText("Cập nhật: " + self._last_update.strftime("%H:%M:%S.%f")[:-3])
+        self._write_csv(readings)
+
+    def _on_raw(self, raw: bytes) -> None:
+        if self.hex_dock.isVisible():
+            self.hex_view.setPlainText(_hex_dump(raw))
+
+    def _on_error(self, msg: str) -> None:
+        self.conn_label.setText("⚠ " + msg)
+
+    # -------------------------------------------------------------- helpers -- #
+    def _set_num(self, row: int, col: int, text: str, valid: bool) -> None:
+        item = self.table.item(row, col)
+        item.setText(text)
+        item.setForeground(QColor("#202020") if valid else QColor("#9aa0a6"))
+
+    def _mark_all_stale(self) -> None:
+        for ch in range(self.table.rowCount()):
+            for col in (COL_VALUE, COL_PEAK, COL_BOTTOM, COL_PP):
+                self._set_num(ch, col, "---", False)
+            self.table.item(ch, COL_JUDGE).setText("--")
+            self.table.item(ch, COL_STATUS).setText("--")
+
+    def _update_conn_ui(self, connected: bool) -> None:
+        self.connect_btn.setEnabled(True)
+        self.connect_btn.setText("Ngắt kết nối" if connected else "Kết nối")
+        for w in (self.ip_edit, self.instance_spin):
+            w.setEnabled(not connected)
+
+    # ------------------------------------------------------------------ CSV -- #
+    def _on_csv_toggled(self, on: bool) -> None:
+        if on:
+            default = "sensor_log_" + _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
+            path, _ = QFileDialog.getSaveFileName(self, "Lưu log CSV", default, "CSV (*.csv)")
+            if not path:
+                self.csv_chk.setChecked(False)
+                return
+            try:
+                self._csv_file = open(path, "w", newline="", encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.warning(self, "CSV", f"Không mở được file:\n{exc}")
+                self.csv_chk.setChecked(False)
+                return
+            self._csv_writer = csv.writer(self._csv_file)
+            header = ["timestamp"]
+            for ch in range(self.config.channels.count):
+                name = self.config.channels.name(ch)
+                header += [f"{name}_value", f"{name}_peak", f"{name}_bottom", f"{name}_pp"]
+            self._csv_writer.writerow(header)
+        else:
+            self._close_csv()
+
+    def _write_csv(self, readings: List[SensorReading]) -> None:
+        if self._csv_writer is None:
+            return
+        dec = self.config.display.decimals
+
+        def fmt(x):
+            return "" if x is None else round(x, dec)
+
+        row = [_dt.datetime.now().isoformat(timespec="milliseconds")]
+        by_ch = {r.channel: r for r in readings}
+        for ch in range(self.config.channels.count):
+            r = by_ch.get(ch)
+            if r is None:
+                row += ["", "", "", ""]
+            else:
+                row += [fmt(r.value), fmt(r.peak), fmt(r.bottom), fmt(r.pp)]
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
+
+    def _close_csv(self) -> None:
+        if self._csv_file is not None:
+            try:
+                self._csv_file.close()
+            finally:
+                self._csv_file = None
+                self._csv_writer = None
+
+    # ------------------------------------------------------------- shutdown -- #
+    def closeEvent(self, event) -> None:
+        # Stop the timer + disconnect *inside* the worker thread before we tear
+        # the thread down, so no QTimer is destroyed across threads.
+        if self._worker is not None and self._thread is not None and self._thread.isRunning():
+            QMetaObject.invokeMethod(self._worker, "close", Qt.BlockingQueuedConnection)
+        self._teardown_thread()
+        self._close_csv()
+        event.accept()
+
+
+def _hex_dump(data: bytes, width: int = 16) -> str:
+    """Classic offset / hex / ASCII dump for verifying the data map."""
+    lines = [f"len = {len(data)} bytes", ""]
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hex_part = " ".join(f"{b:02X}" for b in chunk)
+        hex_part = f"{hex_part:<{width * 3 - 1}}"
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{off:04X}  {hex_part}  |{ascii_part}|")
+    return "\n".join(lines)
