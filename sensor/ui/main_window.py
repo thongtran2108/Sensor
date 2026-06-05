@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import AppConfig
-from ..driver.keyence_dlen1 import KeyenceDLEN1Driver
+from ..driver.keyence_socket import KeyenceSocketDriver
 from ..models import Judgment, SensorReading
 from .poller import PollWorker
 
@@ -51,14 +51,14 @@ class MainWindow(QMainWindow):
         self.config = config
         self._thread: Optional[QThread] = None
         self._worker: Optional[PollWorker] = None
-        self._driver: Optional[KeyenceDLEN1Driver] = None
+        self._driver: Optional[KeyenceSocketDriver] = None
         self._connected = False
 
         self._csv_file = None
         self._csv_writer = None
         self._last_update: Optional[_dt.datetime] = None
 
-        self.setWindowTitle("KEYENCE GT2 / DL-EN1 — Sensor Monitor")
+        self.setWindowTitle("KEYENCE Sensor Monitor — TCP socket")
         self.resize(1000, 560)
 
         self._build_toolbar()
@@ -75,15 +75,21 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(QLabel(" IP: "))
         self.ip_edit = QLineEdit(self.config.device.ip)
-        self.ip_edit.setFixedWidth(130)
+        self.ip_edit.setFixedWidth(120)
         tb.addWidget(self.ip_edit)
 
-        tb.addWidget(QLabel("  Assembly: "))
-        self.instance_spin = QSpinBox()
-        self.instance_spin.setRange(1, 65535)
-        self.instance_spin.setValue(self.config.device.assembly_instance)
-        self.instance_spin.setToolTip("Input assembly instance của DL-EN1")
-        tb.addWidget(self.instance_spin)
+        tb.addWidget(QLabel("  Port: "))
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(self.config.device.port)
+        self.port_spin.setToolTip("Cổng TCP của thiết bị (tự đặt)")
+        tb.addWidget(self.port_spin)
+
+        tb.addWidget(QLabel("  Lệnh: "))
+        self.command_edit = QLineEdit(self.config.protocol.command)
+        self.command_edit.setFixedWidth(70)
+        self.command_edit.setToolTip("Lệnh gửi đi (terminator CR/LF tự thêm), ví dụ M0")
+        tb.addWidget(self.command_edit)
 
         tb.addWidget(QLabel("  Chu kỳ (ms): "))
         self.interval_spin = QSpinBox()
@@ -151,7 +157,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.table)
 
     def _build_hex_dock(self) -> None:
-        self.hex_dock = QDockWidget("Dữ liệu thô (input assembly)", self)
+        self.hex_dock = QDockWidget("Giao tiếp thô (lệnh gửi / phản hồi)", self)
         self.hex_view = QPlainTextEdit()
         self.hex_view.setReadOnly(True)
         self.hex_view.setFont(QFont("Monospace"))
@@ -175,10 +181,11 @@ class MainWindow(QMainWindow):
     def _start_connection(self) -> None:
         # Pull the latest values from the toolbar into the config.
         self.config.device.ip = self.ip_edit.text().strip()
-        self.config.device.assembly_instance = self.instance_spin.value()
+        self.config.device.port = self.port_spin.value()
+        self.config.protocol.command = self.command_edit.text().strip() or "M0"
         self.config.polling.interval_ms = self.interval_spin.value()
 
-        self._driver = KeyenceDLEN1Driver(self.config)
+        self._driver = KeyenceSocketDriver(self.config)
         self._worker = PollWorker(self._driver, self.config.polling.interval_ms)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
@@ -250,9 +257,9 @@ class MainWindow(QMainWindow):
         self.update_label.setText("Cập nhật: " + self._last_update.strftime("%H:%M:%S.%f")[:-3])
         self._write_csv(readings)
 
-    def _on_raw(self, raw: bytes) -> None:
+    def _on_raw(self, raw: str) -> None:
         if self.hex_dock.isVisible():
-            self.hex_view.setPlainText(_hex_dump(raw))
+            self.hex_view.setPlainText(raw)
 
     def _on_error(self, msg: str) -> None:
         self.conn_label.setText("⚠ " + msg)
@@ -273,7 +280,7 @@ class MainWindow(QMainWindow):
     def _update_conn_ui(self, connected: bool) -> None:
         self.connect_btn.setEnabled(True)
         self.connect_btn.setText("Ngắt kết nối" if connected else "Kết nối")
-        for w in (self.ip_edit, self.instance_spin):
+        for w in (self.ip_edit, self.port_spin, self.command_edit):
             w.setEnabled(not connected)
 
     # ------------------------------------------------------------------ CSV -- #
@@ -335,15 +342,3 @@ class MainWindow(QMainWindow):
         self._teardown_thread()
         self._close_csv()
         event.accept()
-
-
-def _hex_dump(data: bytes, width: int = 16) -> str:
-    """Classic offset / hex / ASCII dump for verifying the data map."""
-    lines = [f"len = {len(data)} bytes", ""]
-    for off in range(0, len(data), width):
-        chunk = data[off:off + width]
-        hex_part = " ".join(f"{b:02X}" for b in chunk)
-        hex_part = f"{hex_part:<{width * 3 - 1}}"
-        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-        lines.append(f"{off:04X}  {hex_part}  |{ascii_part}|")
-    return "\n".join(lines)

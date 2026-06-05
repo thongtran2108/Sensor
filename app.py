@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point for the KEYENCE GT2 / DL-EN1 test GUI.
+"""Entry point for the KEYENCE TCP-socket sensor test GUI.
 
 Usage:
     python app.py [--config config.yaml]
@@ -14,7 +14,7 @@ from sensor.config import AppConfig
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="KEYENCE GT2 / DL-EN1 sensor monitor")
+    parser = argparse.ArgumentParser(description="KEYENCE TCP-socket sensor monitor")
     parser.add_argument(
         "--config",
         default=os.path.join(os.path.dirname(__file__), "config.yaml"),

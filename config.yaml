@@ -1,54 +1,46 @@
 # =============================================================================
-#  Cấu hình đọc cảm biến KEYENCE GT2 qua bộ truyền thông DL-EN1 (EtherNet/IP)
+#  Cấu hình đọc cảm biến KEYENCE qua TCP socket (giao tiếp lệnh ASCII)
 # -----------------------------------------------------------------------------
-#  QUAN TRỌNG: các offset/scale bên dưới PHẢI khớp với cách DL-EN1 của bạn được
-#  cấu hình. Vị trí byte của từng giá trị thay đổi theo "data allocation" mà bạn
-#  chọn trên DL-EN1 (xem User's Manual của DL-EN1, mục EtherNet/IP / assembly).
+#  Kết nối socket tới (ip:port) rồi gửi lệnh + terminator, ví dụ:  M0<CR><LF>
+#  Mặc định coi phản hồi là các giá trị ngăn cách bởi dấu phẩy, MỖI KÊNH MỘT
+#  GIÁ TRỊ (CH0, CH1, ...). Nếu thiết bị của bạn trả khác, chỉnh phần `protocol`.
 #
-#  Cách dò nhanh trên máy thật:
+#  Kiểm tra nhanh trên máy thật:
 #    python tools/test_connection.py --watch
-#  -> Xem dump hex, di chuyển 1 đầu dò và quan sát byte nào thay đổi để xác định
-#     offset; so giá trị giải mã với số trên màn hình amplifier để chỉnh `scale`.
+#  -> Xem chuỗi phản hồi THÔ để biết đúng định dạng, rồi chỉnh parser/scale.
 # =============================================================================
 
 device:
-  ip: "192.168.0.10"        # địa chỉ IP của DL-EN1 (đổi theo thiết bị của bạn)
-  assembly_instance: 100    # input (T->O) assembly instance của DL-EN1
-  attribute: 3              # Assembly object data attribute (thường = 3)
-  unconnected: true         # true: explicit messaging không cần mở I/O connection
-  route_path: false         # false: gửi thẳng tới thiết bị (không định tuyến backplane)
-  timeout: 5.0
+  ip: "192.168.0.10"        # IP của thiết bị (tự đặt)
+  port: 8501                # cổng TCP (tự đặt)
+  timeout: 2.0              # timeout socket (giây)
+  encoding: "ascii"         # giao thức lệnh KEYENCE là ASCII
+  terminator: "CRLF"        # CRLF | CR | LF  (hoặc ghi trực tiếp "\r\n")
 
 channels:
-  count: 8                  # số amplifier (kênh) -> sinh ra CH0..CH7
+  count: 8                  # số cảm biến (kênh) -> CH0..CH7
   # names:                  # (tuỳ chọn) gán tên riêng thay cho CH0, CH1...
   #   0: "F02"
   #   1: "F05"
 
-# Bố cục dữ liệu trong mảng byte của input assembly.
-#   địa chỉ field = data_offset + channel_index * stride + field.offset
-datamap:
-  data_offset: 0            # số byte bỏ qua trước khối của CH0 (vùng header/status)
-  stride: 16                # số byte cho mỗi kênh (ví dụ 4 field DINT = 16 byte)
-  byte_order: little        # little | big  (EtherNet/IP thường là little-endian)
+protocol:
+  # all_in_one : gửi `command` 1 lần, phản hồi có 1 giá trị cho mỗi kênh.
+  # per_channel: gửi `command_template` cho từng kênh (M0, M1, ... ), mỗi phản hồi 1 giá trị.
+  read_mode: "all_in_one"
+  command: "M0"             # lệnh đọc giá trị (all_in_one)
+  command_template: "M{n}"  # lệnh theo kênh (per_channel); {n} = chỉ số kênh
 
-  # Bỏ field nào không có trong dữ liệu của bạn (ví dụ nếu DL-EN1 chỉ xuất "value"
-  # thì xoá peak/bottom/pp và đặt stride: 4).
-  fields:
-    value:  { offset: 0,  type: int32, scale: 0.0001 }   # giá trị đo hiện tại
-    peak:   { offset: 4,  type: int32, scale: 0.0001 }   # đỉnh (max hold)
-    bottom: { offset: 8,  type: int32, scale: 0.0001 }   # đáy (min hold)
-    pp:     { offset: 12, type: int32, scale: 0.0001 }   # biên độ (nếu bỏ -> tự tính peak-bottom)
+  # (tuỳ chọn) đọc thêm peak/bottom/pp bằng các lệnh khác (all_in_one).
+  # Bỏ trống nếu thiết bị chỉ trả giá trị đo qua M0.
+  extra_commands: {}
+  #   peak:   "<lệnh peak>"
+  #   bottom: "<lệnh bottom>"
+  #   pp:     "<lệnh pp>"
 
-  # (tuỳ chọn) lấy phán định HI/GO/LO từ 1 status word của mỗi kênh.
-  status:
-    enabled: false
-    offset: 0
-    type: uint16
-    bits: { hi: 0, go: 1, lo: 2, alarm: 7 }
-
-  # Các giá trị thô coi là "không hợp lệ / tràn thang" (màn hình hiện "F").
-  invalid_values: [999999999, -999999999, 2147483647, -2147483648]
+  strip_echo: true          # bỏ token đầu nếu là echo lệnh (vd "M0")
+  scale: 1.0                # giá trị = số_đọc * scale (KEYENCE thường trả sẵn theo đơn vị hiển thị)
+  invalid_tokens: ["F", "FFFFFF", "-FFFFFF", "------", "OVER", "FFFF"]  # token = tràn thang
+  invalid_values: [999999999, -999999999]                              # số coi là không hợp lệ
 
 display:
   unit: "mm"

@@ -1,8 +1,9 @@
 """Configuration model loaded from ``config.yaml``.
 
-Every layout-dependent value (assembly instance, byte offsets, scaling, ...)
-lives here so the program can be matched to a specific DL-EN1 configuration
-*without touching the code*. See ``config.yaml`` for inline documentation.
+The transport is a plain TCP socket speaking KEYENCE's ASCII command protocol
+(e.g. send ``M0\\r\\n``, read the reply). Everything that depends on the device
+(IP, port, command text, line terminator, value scaling, ...) lives here so the
+program can be matched to a device *without touching the code*.
 """
 from __future__ import annotations
 
@@ -12,90 +13,76 @@ from typing import Dict, List, Optional
 
 import yaml
 
-
-# --------------------------------------------------------------------------- #
-# Field / data-map specs
-# --------------------------------------------------------------------------- #
-@dataclass
-class FieldSpec:
-    """One numeric field inside a channel's data block."""
-
-    offset: int          # byte offset relative to the start of the channel block
-    type: str = "int32"  # int8/uint8/int16/uint16/int32/uint32/int64/uint64/float32/float64
-    scale: float = 1.0   # engineering value = raw * scale
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "FieldSpec":
-        return cls(offset=int(d["offset"]),
-                   type=str(d.get("type", "int32")),
-                   scale=float(d.get("scale", 1.0)))
+# Named line terminators -> actual control characters. Using names avoids the
+# YAML single/double-quote escaping pitfalls around "\r\n".
+TERMINATORS = {"CRLF": "\r\n", "CR": "\r", "LF": "\n"}
 
 
-@dataclass
-class StatusSpec:
-    """Optional status word used to derive the HI/GO/LO judgment."""
-
-    enabled: bool = False
-    offset: int = 0
-    type: str = "uint16"
-    bits: Dict[str, int] = field(default_factory=dict)  # e.g. {hi:0, go:1, lo:2, alarm:7}
-
-    @classmethod
-    def from_dict(cls, d: Optional[dict]) -> "StatusSpec":
-        d = d or {}
-        return cls(enabled=bool(d.get("enabled", False)),
-                   offset=int(d.get("offset", 0)),
-                   type=str(d.get("type", "uint16")),
-                   bits={k: int(v) for k, v in (d.get("bits") or {}).items()})
-
-
-@dataclass
-class DataMap:
-    """How the flat input-assembly byte array maps to per-channel values."""
-
-    data_offset: int = 0          # bytes to skip before CH0's block (header)
-    stride: int = 16              # bytes per channel block
-    byte_order: str = "little"    # "little" or "big"
-    fields: Dict[str, FieldSpec] = field(default_factory=dict)  # value/peak/bottom/pp
-    status: StatusSpec = field(default_factory=StatusSpec)
-    invalid_values: List[int] = field(default_factory=lambda: [
-        999999999, -999999999, 2147483647, -2147483648,
-    ])
-
-    @classmethod
-    def from_dict(cls, d: Optional[dict]) -> "DataMap":
-        d = d or {}
-        fields = {k: FieldSpec.from_dict(v) for k, v in (d.get("fields") or {}).items()}
-        return cls(
-            data_offset=int(d.get("data_offset", 0)),
-            stride=int(d.get("stride", 16)),
-            byte_order=str(d.get("byte_order", "little")),
-            fields=fields,
-            status=StatusSpec.from_dict(d.get("status")),
-            invalid_values=list(d.get("invalid_values", [
-                999999999, -999999999, 2147483647, -2147483648])),
-        )
+def resolve_terminator(value: str) -> str:
+    """Turn 'CRLF' / 'CR' / 'LF' or a literal like '\\r\\n' into real chars."""
+    if value in TERMINATORS:
+        return TERMINATORS[value]
+    # interpret backslash escapes such as "\r\n" written literally
+    return value.encode("utf-8").decode("unicode_escape")
 
 
 @dataclass
 class DeviceCfg:
     ip: str = "192.168.0.10"
-    assembly_instance: int = 100   # input (T->O) assembly instance of the DL-EN1
-    attribute: int = 3             # Assembly object data attribute
-    unconnected: bool = True       # use unconnected explicit messaging
-    route_path: bool = False       # CIP routing path (False = talk directly to device)
-    timeout: float = 5.0
+    port: int = 8501                 # TCP port of the command server (custom)
+    timeout: float = 2.0             # socket timeout in seconds
+    encoding: str = "ascii"          # KEYENCE command protocol is ASCII
+    terminator: str = "CRLF"         # CRLF | CR | LF | literal e.g. "\r\n"
+
+    @property
+    def term(self) -> str:
+        return resolve_terminator(self.terminator)
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "DeviceCfg":
         d = d or {}
         return cls(
             ip=str(d.get("ip", "192.168.0.10")),
-            assembly_instance=int(d.get("assembly_instance", 100)),
-            attribute=int(d.get("attribute", 3)),
-            unconnected=bool(d.get("unconnected", True)),
-            route_path=bool(d.get("route_path", False)),
-            timeout=float(d.get("timeout", 5.0)),
+            port=int(d.get("port", 8501)),
+            timeout=float(d.get("timeout", 2.0)),
+            encoding=str(d.get("encoding", "ascii")),
+            terminator=str(d.get("terminator", "CRLF")),
+        )
+
+
+@dataclass
+class ProtocolCfg:
+    """How to ask for values and how to read the reply."""
+
+    # "all_in_one": send `command` once, reply has one value per channel
+    #               (comma separated).
+    # "per_channel": send `command_template` once per channel (e.g. M0, M1, ...)
+    read_mode: str = "all_in_one"
+    command: str = "M0"                     # value command (all_in_one)
+    command_template: str = "M{n}"          # per-channel command (per_channel)
+    extra_commands: Dict[str, str] = field(default_factory=dict)  # field -> command
+    strip_echo: bool = True                 # drop a leading echo token like "M0"
+    scale: float = 1.0                      # value = parsed_number * scale
+    invalid_tokens: List[str] = field(default_factory=lambda: [
+        "F", "FFFFFF", "-FFFFFF", "------", "OVER", "FFFF",
+    ])
+    invalid_values: List[float] = field(default_factory=lambda: [
+        999999999, -999999999,
+    ])
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> "ProtocolCfg":
+        d = d or {}
+        return cls(
+            read_mode=str(d.get("read_mode", "all_in_one")),
+            command=str(d.get("command", "M0")),
+            command_template=str(d.get("command_template", "M{n}")),
+            extra_commands={str(k): str(v) for k, v in (d.get("extra_commands") or {}).items()},
+            strip_echo=bool(d.get("strip_echo", True)),
+            scale=float(d.get("scale", 1.0)),
+            invalid_tokens=list(d.get("invalid_tokens", [
+                "F", "FFFFFF", "-FFFFFF", "------", "OVER", "FFFF"])),
+            invalid_values=list(d.get("invalid_values", [999999999, -999999999])),
         )
 
 
@@ -138,8 +125,8 @@ class PollingCfg:
 @dataclass
 class AppConfig:
     device: DeviceCfg = field(default_factory=DeviceCfg)
+    protocol: ProtocolCfg = field(default_factory=ProtocolCfg)
     channels: ChannelsCfg = field(default_factory=ChannelsCfg)
-    datamap: DataMap = field(default_factory=DataMap)
     display: DisplayCfg = field(default_factory=DisplayCfg)
     polling: PollingCfg = field(default_factory=PollingCfg)
 
@@ -148,8 +135,8 @@ class AppConfig:
         d = d or {}
         return cls(
             device=DeviceCfg.from_dict(d.get("device")),
+            protocol=ProtocolCfg.from_dict(d.get("protocol")),
             channels=ChannelsCfg.from_dict(d.get("channels")),
-            datamap=DataMap.from_dict(d.get("datamap")),
             display=DisplayCfg.from_dict(d.get("display")),
             polling=PollingCfg.from_dict(d.get("polling")),
         )

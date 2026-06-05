@@ -17,7 +17,7 @@ class Judgment(str, Enum):
 
 @dataclass
 class SensorReading:
-    """One sample for a single channel (amplifier) of the DL-EN1 bus.
+    """One sample for a single sensor channel (amplifier).
 
     All numeric fields are *scaled* engineering values (e.g. millimetres).
     A field is ``None`` when it is not configured or the raw value is an
@@ -32,7 +32,6 @@ class SensorReading:
     pp: Optional[float] = None         # peak-to-peak (= peak - bottom)
     judgment: Judgment = Judgment.NONE
     valid: bool = False                # True when the current value is usable
-    raw: Optional[bytes] = None        # raw per-channel bytes (debug / hex view)
 
     def fmt(self, field: str, decimals: int) -> str:
         """Format a numeric field for display, or '---' if unavailable."""

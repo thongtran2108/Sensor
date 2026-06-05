@@ -2,8 +2,8 @@
 
 Network I/O must never run on the GUI thread or the window freezes. This
 ``QObject`` is moved onto its own ``QThread``; a ``QTimer`` living in that
-thread drives ``read_raw`` + ``parse`` and the results are delivered to the UI
-through queued signals.
+thread drives ``read_all`` and the results are delivered to the UI through
+queued signals.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from ..driver.base import SensorDriver
 
 class PollWorker(QObject):
     readings_ready = Signal(list)        # List[SensorReading]
-    raw_ready = Signal(bytes)            # raw assembly bytes
+    raw_ready = Signal(str)              # request/response log (raw text)
     error = Signal(str)
     connection_changed = Signal(bool)
 
@@ -60,15 +60,12 @@ class PollWorker(QObject):
     @Slot()
     def _poll(self) -> None:
         try:
-            raw = self._driver.read_raw()
+            readings = self._driver.read_all()
         except Exception as exc:  # noqa: BLE001
             self.error.emit(f"Lỗi đọc dữ liệu: {exc}")
             return
 
-        self.raw_ready.emit(bytes(raw))
-        try:
-            readings = self._driver.parse(raw)
-        except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"Lỗi giải mã dữ liệu: {exc}")
-            return
         self.readings_ready.emit(readings)
+        raw = getattr(self._driver, "last_exchange", "")
+        if raw:
+            self.raw_ready.emit(raw)
