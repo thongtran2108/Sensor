@@ -38,7 +38,7 @@ protocol:
   #   pp:     "<lệnh pp>"
 
   strip_echo: true          # bỏ token đầu nếu là echo lệnh (vd "M0")
-  scale: 1.0                # giá trị = số_đọc * scale (KEYENCE thường trả sẵn theo đơn vị hiển thị)
+  scale: 0.0001             # giá trị = số_đọc * scale  (vd 310001 -> 31.0001)
   invalid_tokens: ["F", "FFFFFF", "-FFFFFF", "------", "OVER", "FFFF"]  # token = tràn thang
   invalid_values: [999999999, -999999999]                              # số coi là không hợp lệ
 
