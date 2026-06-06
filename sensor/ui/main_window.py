@@ -26,18 +26,11 @@ from PySide6.QtWidgets import (
 
 from ..config import AppConfig
 from ..driver.keyence_socket import KeyenceSocketDriver
-from ..models import Judgment, SensorReading
+from ..models import SensorReading
 from .poller import PollWorker
 
 # Table columns
-COL_CH, COL_VALUE, COL_PEAK, COL_BOTTOM, COL_PP, COL_JUDGE, COL_STATUS = range(7)
-
-_JUDGE_COLOR = {
-    Judgment.GO: QColor("#1b8a3a"),
-    Judgment.HI: QColor("#c0392b"),
-    Judgment.LO: QColor("#2471a3"),
-    Judgment.NONE: QColor("#7f8c8d"),
-}
+COL_CH, COL_VALUE, COL_STATUS = range(3)
 
 
 class MainWindow(QMainWindow):
@@ -115,15 +108,7 @@ class MainWindow(QMainWindow):
 
     def _build_table(self) -> None:
         unit = self.config.display.unit
-        headers = [
-            "Kênh",
-            f"Giá trị ({unit})",
-            f"Peak ({unit})",
-            f"Bottom ({unit})",
-            f"P-P ({unit})",
-            "Phán định",
-            "Trạng thái",
-        ]
+        headers = ["Kênh", f"Giá trị ({unit})", "Trạng thái"]
         n = self.config.channels.count
         self.table = QTableWidget(n, len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -143,16 +128,14 @@ class MainWindow(QMainWindow):
             name_item.setFont(f)
             self.table.setItem(ch, COL_CH, name_item)
 
-            for col in (COL_VALUE, COL_PEAK, COL_BOTTOM, COL_PP):
-                item = QTableWidgetItem("---")
-                item.setFont(mono)
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.table.setItem(ch, col, item)
+            value_item = QTableWidgetItem("---")
+            value_item.setFont(mono)
+            value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(ch, COL_VALUE, value_item)
 
-            for col in (COL_JUDGE, COL_STATUS):
-                item = QTableWidgetItem("--")
-                item.setTextAlignment(Qt.AlignCenter)
-                self.table.setItem(ch, col, item)
+            status_item = QTableWidgetItem("--")
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(ch, COL_STATUS, status_item)
 
         self.setCentralWidget(self.table)
 
@@ -241,13 +224,6 @@ class MainWindow(QMainWindow):
             if r.channel >= self.table.rowCount():
                 continue
             self._set_num(r.channel, COL_VALUE, r.fmt("value", dec), r.valid)
-            self._set_num(r.channel, COL_PEAK, r.fmt("peak", dec), r.valid)
-            self._set_num(r.channel, COL_BOTTOM, r.fmt("bottom", dec), r.valid)
-            self._set_num(r.channel, COL_PP, r.fmt("pp", dec), r.valid)
-
-            jitem = self.table.item(r.channel, COL_JUDGE)
-            jitem.setText(r.judgment.value)
-            jitem.setForeground(_JUDGE_COLOR.get(r.judgment, _JUDGE_COLOR[Judgment.NONE]))
 
             sitem = self.table.item(r.channel, COL_STATUS)
             sitem.setText("OK" if r.valid else "Lỗi/Tràn")
@@ -272,9 +248,7 @@ class MainWindow(QMainWindow):
 
     def _mark_all_stale(self) -> None:
         for ch in range(self.table.rowCount()):
-            for col in (COL_VALUE, COL_PEAK, COL_BOTTOM, COL_PP):
-                self._set_num(ch, col, "---", False)
-            self.table.item(ch, COL_JUDGE).setText("--")
+            self._set_num(ch, COL_VALUE, "---", False)
             self.table.item(ch, COL_STATUS).setText("--")
 
     def _update_conn_ui(self, connected: bool) -> None:
@@ -300,8 +274,7 @@ class MainWindow(QMainWindow):
             self._csv_writer = csv.writer(self._csv_file)
             header = ["timestamp"]
             for ch in range(self.config.channels.count):
-                name = self.config.channels.name(ch)
-                header += [f"{name}_value", f"{name}_peak", f"{name}_bottom", f"{name}_pp"]
+                header.append(self.config.channels.name(ch))   # one value column per channel
             self._csv_writer.writerow(header)
         else:
             self._close_csv()
@@ -312,16 +285,13 @@ class MainWindow(QMainWindow):
         dec = self.config.display.decimals
 
         def fmt(x):
-            return "" if x is None else round(x, dec)
+            return "" if x is None else round(x, dec)   # empty cell = invalid/over-range
 
         row = [_dt.datetime.now().isoformat(timespec="milliseconds")]
         by_ch = {r.channel: r for r in readings}
         for ch in range(self.config.channels.count):
             r = by_ch.get(ch)
-            if r is None:
-                row += ["", "", "", ""]
-            else:
-                row += [fmt(r.value), fmt(r.peak), fmt(r.bottom), fmt(r.pp)]
+            row.append(fmt(r.value) if r is not None else "")
         self._csv_writer.writerow(row)
         self._csv_file.flush()
 
